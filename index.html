@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Voice Clone Studio</title>
+  <style>
+    :root {
+      --primary: #4f46e5;
+      --primary-hover: #4338ca;
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --border: #334155;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: sans-serif; }
+    body { background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 2rem 1rem; }
+    .container { width: 100%; max-width: 680px; background: var(--card-bg); border-radius: 16px; padding: 2rem; border: 1px solid var(--border); }
+    h1 { font-size: 1.6rem; text-align: center; margin-bottom: 0.5rem; color: #a5b4fc; }
+    .subtitle { text-align: center; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.5rem; }
+    .alert { background: #7f1d1d; border: 1px solid #ef4444; color: #fecaca; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; font-size: 0.9rem; display: none; line-height: 1.4; }
+    .section { margin-bottom: 1.5rem; }
+    label { display: block; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.5rem; }
+    input[type="file"], textarea { width: 100%; padding: 0.75rem; border-radius: 8px; border: 1px solid var(--border); background: #0f172a; color: var(--text); }
+    textarea { height: 80px; resize: vertical; }
+    .hint { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.3rem; }
+    button { width: 100%; padding: 0.9rem; border: none; border-radius: 8px; background: var(--primary); color: white; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status-box { margin-top: 1rem; padding: 0.8rem; border-radius: 8px; background: #0f172a; font-size: 0.85rem; color: #38bdf8; border: 1px solid var(--border); min-height: 40px; word-break: break-all; }
+    .result-container { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border); display: none; flex-direction: column; gap: 1rem; }
+    audio { width: 100%; }
+    .btn-download { background: #334155; color: white; text-align: center; padding: 0.75rem; border-radius: 8px; text-decoration: none; font-weight: 600; display: block; }
+  </style>
+
+  <!-- Transformers.js CDN -->
+  <script type="module">
+    import { pipeline, env, AutoModel, AutoProcessor } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+    env.allowLocalModels = false;
+    window.transformers = { pipeline, AutoModel, AutoProcessor };
+    window.dispatchEvent(new Event('transformers-loaded'));
+  </script>
+</head>
+<body>
+
+  <div class="container">
+    <div id="protocolAlert" class="alert">
+      ⚠️ <strong>動作環境エラー (file:// プロトコル)</strong><br>
+      ブラウザのセキュリティ制限により、ローカルファイル直接実行ではAIモデルを読み込めません。<br>
+      <strong>GitHub Pages</strong> に公開するか、<strong>ローカルWebサーバー（http://localhost:...）</strong> 経由で開いてください。
+    </div>
+
+    <h1>AI Voice Clone Studio</h1>
+    <p class="subtitle">動画の声質を手本にして、ブラウザ単体で新しい言葉を喋らせます</p>
+
+    <div class="section">
+      <label>1. リファレンス動画 / 音声</label>
+      <input type="file" id="videoInput" accept="video/*,audio/*">
+      <p class="hint">クリアな声の音源を推奨（動画から直接抽出されます）</p>
+    </div>
+
+    <div class="section">
+      <label>2. 喋らせたい文字列</label>
+      <textarea id="textInput">Yajuuzennpai saikou!</textarea>
+      <p class="hint">※英語音素モデルのため、ローマ字で入力すると綺麗に喋ります。</p>
+    </div>
+
+    <button id="generateBtn" disabled>AIモデルを読み込み中...</button>
+    <div class="status-box" id="statusLog">ライブラリの読み込みを待機しています...</div>
+
+    <div class="result-container" id="resultContainer">
+      <label>3. 生成された音声</label>
+      <audio id="audioPlayer" controls></audio>
+      <a id="downloadBtn" class="btn-download">WAVファイルをダウンロード</a>
+    </div>
+  </div>
+
+  <script>
+    const alertBox = document.getElementById('protocolAlert');
+    const videoInput = document.getElementById('videoInput');
+    const textInput = document.getElementById('textInput');
+    const generateBtn = document.getElementById('generateBtn');
+    const statusLog = document.getElementById('statusLog');
+    const resultContainer = document.getElementById('resultContainer');
+    const audioPlayer = document.getElementById('audioPlayer');
+    const downloadBtn = document.getElementById('downloadBtn');
+
+    let audioContext = null;
+    let referenceWav16k = null;
+    let ttsPipeline = null;
+    let speakerModel = null;
+    let speakerProcessor = null;
+
+    // file:// プロトコルチェック
+    if (window.location.protocol === 'file:') {
+      alertBox.style.display = 'block';
+      statusLog.style.color = '#f87171';
+      statusLog.textContent = 'エラー: file:// では実行できません。Webサーバー環境が必要です。';
+    }
+
+    function log(msg, isError = false) {
+      statusLog.textContent = msg;
+      statusLog.style.color = isError ? '#f87171' : '#38bdf8';
+    }
+
+    // モデル読み込み
+    window.addEventListener('transformers-loaded', async () => {
+      if (window.location.protocol === 'file:') return;
+
+      try {
+        log("AIモデルをダウンロード中...（初回のみ数十MB〜百MB程度、少しお待ちください）");
+        const { pipeline, AutoModel, AutoProcessor } = window.transformers;
+
+        // TTSモデル
+        ttsPipeline = await pipeline('text-to-speech', 'Xenova/speecht5_tts', {
+          progress_callback: (p) => {
+            if (p.status === 'progress') {
+              log(`モデル取得中: ${p.file} (${Math.round(p.progress || 0)}%)`);
+            }
+          }
+        });
+
+        // 声質分析モデル
+        log("話者特徴抽出モデルを準備中...");
+        speakerModel = await AutoModel.from_pretrained('Xenova/speecht5_spkrec');
+        speakerProcessor = await AutoProcessor.from_pretrained('Xenova/speecht5_spkrec');
+
+        log("AIモデルの準備が完了しました！動画を指定してください。");
+        checkState();
+      } catch (err) {
+        console.error(err);
+        log("モデル読み込みエラー: " + err.message, true);
+      }
+    });
+
+    // 音声抽出
+    videoInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      try {
+        log("動画から音声波形を抽出＆リサンプリング中...");
+        if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        
+        const arrayBuf = await file.arrayBuffer();
+        const decoded = await audioContext.decodeAudioData(arrayBuf);
+
+        // 16kHzに変換
+        const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * 16000), 16000);
+        const src = offline.createBufferSource();
+        src.buffer = decoded;
+        src.connect(offline.destination);
+        src.start(0);
+
+        const rendered = await offline.startRendering();
+        referenceWav16k = rendered.getChannelData(0);
+        
+        log(`音声抽出完了 (${(referenceWav16k.length / 16000).toFixed(1)}秒の音声)`);
+        checkState();
+      } catch (err) {
+        log("音声抽出失敗: " + err.message, true);
+      }
+    });
+
+    function checkState() {
+      if (ttsPipeline && speakerModel && referenceWav16k && textInput.value.trim()) {
+        generateBtn.disabled = false;
+        generateBtn.textContent = "ボイスクローン音声を生成する";
+      }
+    }
+
+    textInput.addEventListener('input', checkState);
+
+    // 音声生成実行
+    generateBtn.addEventListener('click', async () => {
+      try {
+        generateBtn.disabled = true;
+        resultContainer.style.display = 'none';
+
+        log("抽出した音声から声質（話者埋め込み）を計算中...");
+        // 参照音声の先頭最大10秒を切り出し
+        const clip = referenceWav16k.subarray(0, Math.min(referenceWav16k.length, 16000 * 10));
+        const processed = await speakerProcessor(clip);
+        const { speaker_embeddings } = await speakerModel(processed);
+
+        log("ブラウザ内でAI音声合成を実行中...");
+        const out = await ttsPipeline(textInput.value.trim(), {
+          speaker_embeddings: speaker_embeddings
+        });
+
+        // WAV Blob作成
+        const wavBlob = encodeWAV(out.audio, out.sampling_rate);
+        const url = URL.createObjectURL(wavBlob);
+
+        audioPlayer.src = url;
+        downloadBtn.href = url;
+        downloadBtn.download = `cloned_voice_${Date.now()}.wav`;
+
+        resultContainer.style.display = 'flex';
+        log("生成完了！再生またはダウンロードできます。");
+      } catch (err) {
+        log("生成エラー: " + err.message, true);
+      } finally {
+        generateBtn.disabled = false;
+      }
+    });
+
+    function encodeWAV(samples, sampleRate) {
+      const buf = new ArrayBuffer(44 + samples.length * 2);
+      const v = new DataView(buf);
+      const s = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+      s(0, 'RIFF');
+      v.setUint32(4, 36 + samples.length * 2, true);
+      s(8, 'WAVE');
+      s(12, 'fmt ');
+      v.setUint32(16, 16, true);
+      v.setUint16(20, 1, true);
+      v.setUint16(22, 1, true);
+      v.setUint32(24, sampleRate, true);
+      v.setUint32(28, sampleRate * 2, true);
+      v.setUint16(32, 2, true);
+      v.setUint16(34, 16, true);
+      s(36, 'data');
+      v.setUint32(40, samples.length * 2, true);
+      let idx = 44;
+      for (let i = 0; i < samples.length; i++) {
+        let x = Math.max(-1, Math.min(1, samples[i]));
+        v.setInt16(idx, x < 0 ? x * 0x8000 : x * 0x7FFF, true);
+        idx += 2;
+      }
+      return new Blob([v], { type: 'audio/wav' });
+    }
+  </script>
+</body>
+</html>
